@@ -32,6 +32,9 @@ RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
     -o /out/wormhole-relay ./cmd/relay-server
 
 FROM docker.io/library/alpine:3.21
+LABEL org.opencontainers.image.source="https://github.com/dougsko/wormhole-relay" \
+      org.opencontainers.image.description="Go port of magic-wormhole-transit-relay (transit relay)" \
+      org.opencontainers.image.licenses="MIT"
 RUN adduser -D -u 10001 wormhole \
     && mkdir -p /data \
     && chown wormhole:wormhole /data

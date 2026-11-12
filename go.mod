@@ -1,4 +1,4 @@
-module wormhole-relay
+module github.com/dougsko/wormhole-relay
 
 go 1.26.0
 

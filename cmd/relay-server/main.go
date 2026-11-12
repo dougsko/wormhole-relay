@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"wormhole-relay/internal/relay"
+	"github.com/dougsko/wormhole-relay/internal/relay"
 
 	"github.com/gorilla/websocket"
 )

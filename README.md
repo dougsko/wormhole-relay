@@ -1,5 +1,7 @@
 # Wormhole Transit Relay (Go)
 
+Public home: <https://github.com/dougsko/wormhole-relay>
+
 A Go reimplementation of the
 [Magic Wormhole transit relay](https://github.com/magic-wormhole/magic-wormhole-transit-relay)
 server, which the Magic Wormhole protocol uses to establish direct TCP/WebSocket
@@ -30,8 +32,16 @@ Once relaying, bytes are forwarded verbatim between the two sockets.
 ## Usage
 
 ```sh
+git clone https://github.com/dougsko/wormhole-relay.git
+cd wormhole-relay
 go build ./cmd/relay-server
 ./relay-server [options]
+```
+
+Or install the binary directly with Go:
+
+```sh
+go install github.com/dougsko/wormhole-relay/cmd/relay-server@latest
 ```
 
 Options — the names, short flags, and defaults match the Python
@@ -86,8 +96,8 @@ themselves (twisted `usage.Options` doesn't, and neither do these ports).
 Example, using both Go servers:
 
 ```sh
-wormhole-mailbox --port 4500 --channel-db /tmp/mb.sqlite &
-wormhole-relay-server --port 4001 --usage-db /tmp/relay-usage.sqlite &
+mailbox-server --port 4500 --channel-db /tmp/mb.sqlite &
+relay-server --port 4001 --usage-db /tmp/relay-usage.sqlite &
 export WORMHOLE_RELAY_URL=ws://localhost:4500/v1
 export WORMHOLE_TRANSIT_HELPER=tcp:localhost:4001
 wormhole send --no-listen FILE            # add --no-listen on both sides to force the relay path
@@ -140,3 +150,9 @@ podman run -d --name wormhole-relay \
   0.24.0) completes a file transfer against the containerized relay and
   mailbox (via `--no-listen` on both sides to force the relay path); the
   usage DB inside `/data` records the expected `happy` row.
+
+## License
+
+MIT — see [LICENSE](LICENSE). This is a Go port of the MIT-licensed Python
+[magic-wormhole-transit-relay](https://github.com/magic-wormhole/magic-wormhole-transit-relay);
+the usage schema under `internal/relay/db-schemas/` is derived verbatim from the reference.

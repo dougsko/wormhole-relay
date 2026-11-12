@@ -2,6 +2,7 @@ package relay
 
 import (
 	"bufio"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -16,9 +17,11 @@ type UsageTracker struct {
 	logFile   *os.File
 }
 
-// UsageWriter interface for recording usage statistics
+// UsageWriter interface for recording usage statistics. waitingTime is nil
+// when the connection was never paired (lonely); the database records NULL,
+// matching the Python reference.
 type UsageWriter interface {
-	RecordUsage(started, buddyStarted time.Time, totalTime, waitingTime float64, totalBytes int, mood Mood)
+	RecordUsage(started time.Time, totalTime float64, waitingTime *float64, totalBytes int, mood Mood)
 	UpdateStats(rebooted, updated time.Time, connected, waiting, incompleteBytes int)
 }
 
@@ -27,6 +30,11 @@ func CreateUsageTracker(blurUsage int, logFile string, usageDB string) (*UsageTr
 	tracker := &UsageTracker{
 		backends:  map[string]UsageWriter{},
 		blurUsage: blurUsage,
+	}
+	if blurUsage > 0 {
+		fmt.Printf("blurring access times to %d seconds\n", blurUsage)
+	} else {
+		fmt.Printf("not blurring access times\n")
 	}
 	if logFile != "" {
 		// logFile can be a path or a file descriptor number
@@ -46,7 +54,11 @@ func CreateUsageTracker(blurUsage int, logFile string, usageDB string) (*UsageTr
 		}
 	}
 	if usageDB != "" {
-		tracker.backends["database"] = &DatabaseUsageWriter{path: usageDB}
+		db, err := OpenUsageDB(usageDB)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open usage db %q: %v", usageDB, err)
+		}
+		tracker.backends["database"] = &DatabaseUsageWriter{db: db}
 	}
 	return tracker, nil
 }
@@ -55,6 +67,7 @@ func CreateUsageTracker(blurUsage int, logFile string, usageDB string) (*UsageTr
 func (ut *UsageTracker) Record(started, buddyStarted time.Time, mood Mood, bytesSent, buddyBytes int) {
 	finished := time.Now()
 	var totalTime, waitingTime float64
+	var hasWaitingTime bool
 	var totalBytes int
 
 	if !buddyStarted.IsZero() {
@@ -63,11 +76,13 @@ func (ut *UsageTracker) Record(started, buddyStarted time.Time, mood Mood, bytes
 		latest := maxTime(starts)
 		totalTime = finished.Sub(earliest).Seconds()
 		waitingTime = latest.Sub(earliest).Seconds()
+		hasWaitingTime = true
 		totalBytes = bytesSent + buddyBytes
 	} else {
 		totalTime = finished.Sub(started).Seconds()
-		waitingTime = 0.0
 		totalBytes = bytesSent
+		// note that "bytesSent" should always be 0 here, but we're
+		// recording what the state-machine remembered anyway
 	}
 
 	// Blur if configured
@@ -76,13 +91,11 @@ func (ut *UsageTracker) Record(started, buddyStarted time.Time, mood Mood, bytes
 		totalBytes = blurSize(totalBytes)
 	}
 
-	ut.notifyBackends(map[string]interface{}{
-		"started":      started,
-		"total_time":   totalTime,
-		"waiting_time": waitingTime,
-		"total_bytes":  totalBytes,
-		"mood":         string(mood),
-	})
+	var waiting *float64
+	if hasWaitingTime {
+		waiting = &waitingTime
+	}
+	ut.notifyBackends(started, totalTime, waiting, totalBytes, mood)
 }
 
 func minTime(t []time.Time) time.Time {
@@ -122,38 +135,27 @@ func blurSize(size int) int {
 	return int(roundTo(int64(size), int64(100e6)))
 }
 
-func (ut *UsageTracker) notifyBackends(data map[string]interface{}) {
+func (ut *UsageTracker) notifyBackends(started time.Time, totalTime float64, waitingTime *float64, totalBytes int, mood Mood) {
 	for _, backend := range ut.backends {
-		if writer, ok := backend.(UsageWriter); ok {
-			writer.RecordUsage(
-				data["started"].(time.Time),
-				time.Time{},
-				data["total_time"].(float64),
-				data["waiting_time"].(float64),
-				data["total_bytes"].(int),
-				Mood(data["mood"].(string)),
-			)
-		}
+		backend.RecordUsage(started, totalTime, waitingTime, totalBytes, mood)
 	}
 }
 
-// UpdateStats updates general statistics
+// UpdateStats updates global statistics
 func (ut *UsageTracker) UpdateStats(rebooted, updated time.Time, connected, waiting, incompleteBytes int) {
 	for _, backend := range ut.backends {
-		if writer, ok := backend.(UsageWriter); ok {
-			writer.UpdateStats(rebooted, updated, connected, waiting, incompleteBytes)
-		}
+		backend.UpdateStats(rebooted, updated, connected, waiting, incompleteBytes)
 	}
 }
 
-// LogFileUsageWriter writes usage records to a file
+// LogFileUsageWriter writes usage records to a file, one JSON object per line
 type LogFileUsageWriter struct {
 	file *os.File
 }
 
-func (lw *LogFileUsageWriter) RecordUsage(started, buddyStarted time.Time, totalTime, waitingTime float64, totalBytes int, mood Mood) {
+func (lw *LogFileUsageWriter) RecordUsage(started time.Time, totalTime float64, waitingTime *float64, totalBytes int, mood Mood) {
 	data := map[string]interface{}{
-		"started":      started.Unix(),
+		"started":      float64(started.UnixNano()) / 1e9,
 		"total_time":   totalTime,
 		"waiting_time": waitingTime,
 		"total_bytes":  totalBytes,
@@ -167,20 +169,46 @@ func (lw *LogFileUsageWriter) RecordUsage(started, buddyStarted time.Time, total
 }
 
 func (lw *LogFileUsageWriter) UpdateStats(rebooted, updated time.Time, connected, waiting, incompleteBytes int) {
-	// Not implemented for log files
+	// not implemented for log files (the Python reference only updates the
+	// database backend as well)
 }
 
-// DatabaseUsageWriter writes usage records to an SQLite database
+// DatabaseUsageWriter writes usage records to an SQLite database. It is the
+// equivalent of DatabaseUsageRecorder in the Python reference; the schema is
+// copied verbatim from db-schemas/v1.sql in magic-wormhole-transit-relay.
 type DatabaseUsageWriter struct {
-	path string
+	db *sql.DB
 }
 
-func (dw *DatabaseUsageWriter) RecordUsage(started, buddyStarted time.Time, totalTime, waitingTime float64, totalBytes int, mood Mood) {
-	// TODO: implement SQLite-backed usage recording
+func (dw *DatabaseUsageWriter) RecordUsage(started time.Time, totalTime float64, waitingTime *float64, totalBytes int, mood Mood) {
+	if _, err := dw.db.Exec("INSERT INTO `usage`"+
+		" (`started`, `total_time`, `waiting_time`, `total_bytes`, `result`)"+
+		" VALUES (?,?,?,?,?)",
+		float64(started.UnixNano())/1e9, totalTime, waitingTime, totalBytes, string(mood)); err != nil {
+		fmt.Printf("warning: unable to record usage: %v\n", err)
+		return
+	}
 }
 
 func (dw *DatabaseUsageWriter) UpdateStats(rebooted, updated time.Time, connected, waiting, incompleteBytes int) {
-	// TODO: implement SQLite-backed current-stats update
+	if _, err := dw.db.Exec("DELETE FROM `current`"); err != nil {
+		fmt.Printf("warning: unable to clear current usage stats: %v\n", err)
+		return
+	}
+	if _, err := dw.db.Exec("INSERT INTO `current`"+
+		" (`rebooted`, `updated`, `connected`, `waiting`, `incomplete_bytes`)"+
+		" VALUES (?,?,?,?,?)",
+		rebooted.Unix(), updated.Unix(), connected, waiting, incompleteBytes); err != nil {
+		fmt.Printf("warning: unable to record current usage stats: %v\n", err)
+	}
+}
+
+// Close closes the underlying database, if any.
+func (dw *DatabaseUsageWriter) Close() error {
+	if dw.db != nil {
+		return dw.db.Close()
+	}
+	return nil
 }
 
 // Force UsageTracker to satisfy UsageRecorder

@@ -26,6 +26,7 @@ const (
 type Mood string
 
 const (
+	MoodEmpty     Mood = "empty" // connected, but never sent a handshake
 	MoodHappy     Mood = "happy"
 	MoodLonely    Mood = "lonely"
 	MoodRedundant Mood = "redundant"
@@ -263,6 +264,7 @@ func NewTransitConnection(conn net.Conn, server *TransitServer) *TransitConnecti
 		conn:    conn,
 		server:  server,
 		state:   StateWaitRelay,
+		mood:    MoodEmpty,
 		started: server.getTimestamp(),
 	}
 }
@@ -499,8 +501,17 @@ func (tc *TransitConnection) connectionLost() {
 	}
 
 	switch tc.state {
-	case StateListening, StateWaitRelay:
+	case StateListening:
+		// the reference records errory for a connection lost before the
+		// state machine ever saw the client, and records no usage
 		tc.mood = MoodErrory
+		tc.state = StateDone
+		tc.mu.Unlock()
+		return
+
+	case StateWaitRelay:
+		// connected, but never sent a handshake: the reference keeps the
+		// initial mood ("empty") and records the usage
 		tc.state = StateDone
 		tc.mu.Unlock()
 		tc.recordUsage()
@@ -593,6 +604,7 @@ func NewWebSocketTransitConnection(conn *websocket.Conn, server *TransitServer) 
 		conn:     conn,
 		server:   server,
 		state:    StateWaitRelay,
+		mood:     MoodEmpty,
 		started:  server.getTimestamp(),
 		firstMsg: true,
 	}
@@ -782,7 +794,8 @@ func (wsc *WebSocketTransitConnection) connectionLost() {
 
 	switch wsc.state {
 	case StateWaitRelay:
-		wsc.mood = MoodErrory
+		// connected, but never sent a handshake: the reference keeps the
+		// initial mood ("empty")
 	case StateWaitPartner:
 		wsc.mood = MoodLonely
 		wsc.server.pendingRequests.Unregister(wsc.token, wsc.side, wsc)

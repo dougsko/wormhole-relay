@@ -2,9 +2,12 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -14,8 +17,7 @@ import (
 )
 
 const (
-	DEFAULT_PORT    = "4001"
-	DEFAULT_WS_PORT = "4002"
+	DEFAULT_PORT = "tcp:4001:interface=::"
 )
 
 type Config struct {
@@ -27,15 +29,82 @@ type Config struct {
 	UsageDB      string
 }
 
+// listenEndpoint is a resolved listen address and its port.
+type listenEndpoint struct {
+	addr string
+	port int
+}
+
+// parseEndpoint parses a twisted-style endpoint string into a net.Listen
+// address. Supported forms (matching the Python twist transitrelay plugin,
+// whose --port/--websocket take "tcp:PORT[:interface=ADDR]"):
+//
+//	tcp:PORT
+//	tcp:PORT:interface=ADDR
+//	PORT
+//	HOST:PORT / [HOST]:PORT
+func parseEndpoint(ep string) (listenEndpoint, error) {
+	var out listenEndpoint
+	ep = strings.TrimSpace(ep)
+	if !strings.HasPrefix(ep, "tcp:") {
+		// bare port or host:port
+		if port, err := strconv.Atoi(ep); err == nil {
+			out.port = port
+			out.addr = fmt.Sprintf(":%d", port)
+			return out, nil
+		}
+		host, portStr, err := net.SplitHostPort(ep)
+		if err != nil {
+			return out, fmt.Errorf("unrecognized endpoint %q (want tcp:PORT[:interface=ADDR] or host:port)", ep)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			return out, fmt.Errorf("unrecognized endpoint %q: bad port %q", ep, portStr)
+		}
+		out.port = port
+		out.addr = net.JoinHostPort(host, portStr)
+		return out, nil
+	}
+	rest := strings.TrimPrefix(ep, "tcp:")
+	parts := strings.Split(rest, ":")
+	if len(parts) == 0 || parts[0] == "" {
+		return out, fmt.Errorf("unrecognized endpoint %q", ep)
+	}
+	port, err := strconv.Atoi(parts[0])
+	if err != nil {
+		return out, fmt.Errorf("unrecognized endpoint %q: bad port %q", ep, parts[0])
+	}
+	iface := ""
+	for _, p := range parts[1:] {
+		if strings.HasPrefix(p, "interface=") {
+			iface = strings.TrimPrefix(p, "interface=")
+		}
+	}
+	out.port = port
+	if iface == "" {
+		out.addr = fmt.Sprintf(":%d", port)
+		return out, nil
+	}
+	if strings.Contains(iface, ":") && !strings.HasPrefix(iface, "[") {
+		out.addr = fmt.Sprintf("[%s]:%d", iface, port)
+		return out, nil
+	}
+	out.addr = net.JoinHostPort(strings.Trim(iface, "[]"), strconv.Itoa(port))
+	return out, nil
+}
+
 func main() {
 	var config Config
-	flag.StringVar(&config.Port, "port", DEFAULT_PORT, "TCP port to listen on")
-	flag.StringVar(&config.WebSocket, "websocket", "", "WebSocket port to listen on (e.g. 4002)")
+	// option names and short flags match the Python "twist transitrelay" plugin
+	flag.StringVar(&config.Port, "port", DEFAULT_PORT, "endpoint to listen on")
+	flag.StringVar(&config.Port, "p", DEFAULT_PORT, "endpoint to listen on (shorthand)")
+	flag.StringVar(&config.WebSocket, "websocket", "", "endpoint to listen for WebSocket connections")
+	flag.StringVar(&config.WebSocket, "w", "", "endpoint to listen for WebSocket connections (shorthand)")
 	flag.StringVar(&config.WebSocketURL, "websocket-url", "", "WebSocket URL (derived from endpoint if not provided)")
+	flag.StringVar(&config.WebSocketURL, "u", "", "WebSocket URL (derived from endpoint if not provided) (shorthand)")
 	flag.IntVar(&config.BlurUsage, "blur-usage", 0, "blur timestamps and data sizes in logs")
 	flag.StringVar(&config.LogFD, "log-fd", "", "write JSON usage logs to this file descriptor")
 	flag.StringVar(&config.UsageDB, "usage-db", "", "record usage data (SQLite)")
-
 	flag.Parse()
 
 	// Create usage tracker
@@ -54,23 +123,36 @@ func main() {
 	IncreaseRLimits()
 
 	// Setup TCP listener
-	listener, err := net.Listen("tcp", ":"+config.Port)
+	tcpEndpoint, err := parseEndpoint(config.Port)
 	if err != nil {
-		log.Fatalf("Failed to listen on TCP %s: %v", config.Port, err)
+		log.Fatalf("bad --port: %v", err)
+	}
+	listener, err := net.Listen("tcp", tcpEndpoint.addr)
+	if err != nil {
+		log.Fatalf("Failed to listen on TCP %s: %v", tcpEndpoint.addr, err)
 	}
 
 	// Setup WebSocket listener if configured
 	var wsListener net.Listener
 	if config.WebSocket != "" {
-		wsListener, err = net.Listen("tcp", ":"+config.WebSocket)
+		wsEndpoint, err := parseEndpoint(config.WebSocket)
 		if err != nil {
-			log.Fatalf("Failed to listen on WebSocket %s: %v", config.WebSocket, err)
+			log.Fatalf("bad --websocket: %v", err)
+		}
+		wsListener, err = net.Listen("tcp", wsEndpoint.addr)
+		if err != nil {
+			log.Fatalf("Failed to listen on WebSocket %s: %v", wsEndpoint.addr, err)
+		}
+		// derive the WebSocket URL like the Python plugin does
+		if config.WebSocketURL == "" {
+			config.WebSocketURL = fmt.Sprintf("ws://localhost:%d/", wsEndpoint.port)
+			fmt.Printf("Using WebSocket URL %q\n", config.WebSocketURL)
 		}
 	}
 
-	log.Printf("Transit relay server listening on TCP :%s", config.Port)
-	if config.WebSocket != "" {
-		log.Printf("Transit relay server listening on WebSocket :%s", config.WebSocket)
+	log.Printf("Transit relay server listening on TCP %s", listener.Addr())
+	if wsListener != nil {
+		log.Printf("Transit relay server listening on WebSocket %s", wsListener.Addr())
 	}
 
 	// Start WebSocket handler
@@ -86,12 +168,20 @@ func main() {
 			}
 			relay.HandleWebSocket(conn, transit)
 		})
-		go http.Serve(wsListener, nil)
+		go func() {
+			if err := http.Serve(wsListener, nil); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("WebSocket server failed: %v", err)
+			}
+		}()
 	}
 
-	// Update stats every 5 minutes
+	// Update stats immediately at startup, then every 5 minutes; mirrors the
+	// reference's TimerService(5*60, transit.update_stats), which twisted
+	// runs immediately when the service starts.
 	go func() {
+		transit.UpdateStats()
 		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
 		for range ticker.C {
 			transit.UpdateStats()
 		}

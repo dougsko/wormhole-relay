@@ -526,3 +526,44 @@ func TestJiltedUsageRecordSuppressed(t *testing.T) {
 		})
 	}
 }
+
+// TestBareConnectionRecordsEmptyMood verifies that a client that connects
+// and disconnects without ever sending a handshake records a usage event
+// with mood "empty" (as the Python reference does), not "errory".
+func TestBareConnectionRecordsEmptyMood(t *testing.T) {
+	usage := &testUsageRecorder{}
+	server := NewTransitServer(usage, func() time.Time { return time.Now() })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	addr := listener.Addr().String()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			go HandleTCPConnection(conn, server)
+		}
+	}()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// connect and immediately disconnect without sending anything
+	_ = conn.Close()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for len(usage.snapshot()) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	events := usage.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one usage record, got %d", len(events))
+	}
+	if events[0].mood != MoodEmpty {
+		t.Fatalf("expected mood empty, got %s", events[0].mood)
+	}
+}

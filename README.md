@@ -34,16 +34,65 @@ go build ./cmd/relay-server
 ./relay-server [options]
 ```
 
-Options:
+Options — the names, short flags, and defaults match the Python
+`twist transitrelay` plugin (twisted `usage.Options`), and the endpoints use
+the same `tcp:PORT[:interface=ADDR]` syntax as twisted's endpoint strings
+(bare ports and `host:port` are also accepted):
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--port` | `4001` | TCP port to listen on |
-| `--websocket` | (disabled) | WebSocket port to listen on (e.g. `4002`) |
-| `--websocket-url` | derived | WebSocket URL to advertise |
-| `--blur-usage` | `0` | Blur timestamps and sizes in usage logs |
-| `--log-fd` | (none) | Write JSON usage logs to a file descriptor |
-| `--usage-db` | (none) | SQLite database for usage tracking (planned) |
+| Flag | Default | Python equivalent | Description |
+|------|---------|-------------------|-------------|
+| `-p`, `--port` | `tcp:4001:interface=::` | `-p`, `--port` | endpoint to listen on |
+| `-w`, `--websocket` | (disabled) | `-w`, `--websocket` | endpoint to listen for WebSocket connections |
+| `-u`, `--websocket-url` | derived | `-u`, `--websocket-url` | WebSocket URL (derived from endpoint if not provided) |
+| `--blur-usage` | `0` | `--blur-usage` | blur timestamps and data sizes in logs (`0` = off) |
+| `--log-fd` | (none) | `--log-fd` | write JSON usage logs to this file descriptor (a number, or a path) |
+| `--usage-db` | (none) | `--usage-db` | record usage data (SQLite) |
+
+Notes on parity with the Python plugin:
+
+- `--port` and `--websocket` take the same twisted endpoint strings the
+  Python plugin accepts (`tcp:PORT`, `tcp:PORT:interface=ADDR`), not just a
+  bare port; the defaults are identical.
+- `--log-fd` matches the Python flag's intent (the Python version is strictly
+  a file descriptor number; we also accept a file path, a superset).
+- `--websocket-url` is accepted for compatibility and derived from the
+  `--websocket` endpoint when not given (`ws://localhost:PORT/`), exactly like
+  the Python plugin. It is not otherwise used (the Python factory also only
+  uses it for that derivation).
+- Usage logging: `--log-fd` writes one JSON object per finished connection
+  (`started`, `total_time`, `waiting_time`, `total_bytes`, `mood`), and
+  `--usage-db` writes the same events into a SQLite database in the reference
+  v1 schema (`db-schemas/usage-v1.sql`, copied verbatim). The `waiting_time`
+  column is `NULL` for connections that were never paired, and moods include
+  `happy`, `lonely`, `redundant`, `impatient`, `errory`, `jilted`, and `empty`
+  (a connection that closed without ever sending a handshake) — the same set
+  the Python version records. In addition, a `current` row (`rebooted`,
+  `updated`, `connected`, `waiting`, `incomplete_bytes`) is written at startup
+  and every 5 minutes, mirroring the reference's `TimerService`.
+
+## Client-side environment variables
+
+Setting a server flag is not enough to make a `wormhole` client talk to it —
+the *client* chooses the servers. The Python `wormhole` CLI (and library)
+reads these environment variables, which are the same for the Go and Python
+servers, since they speak the same protocols:
+
+- `WORMHOLE_RELAY_URL` (`--relay-url`) — mailbox/rendezvous URL, e.g. `ws://localhost:4000/v1`
+- `WORMHOLE_TRANSIT_HELPER` (`--transit-helper`) — `tcp:HOST:PORT` of a transit relay, e.g. `tcp:localhost:4001`
+
+Neither Python server, nor these Go servers, read any environment variables
+themselves (twisted `usage.Options` doesn't, and neither do these ports).
+
+Example, using both Go servers:
+
+```sh
+wormhole-mailbox --port 4500 --channel-db /tmp/mb.sqlite &
+wormhole-relay-server --port 4001 --usage-db /tmp/relay-usage.sqlite &
+export WORMHOLE_RELAY_URL=ws://localhost:4500/v1
+export WORMHOLE_TRANSIT_HELPER=tcp:localhost:4001
+wormhole send --no-listen FILE            # add --no-listen on both sides to force the relay path
+wormhole receive --no-listen --accept-file --output-file OUT CODE
+```
 
 ## Running tests
 

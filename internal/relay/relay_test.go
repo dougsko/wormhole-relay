@@ -3,8 +3,12 @@ package relay
 import (
 	"bytes"
 	"net"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 )
 
 // TestNewTransitServer ensures the server is created properly
@@ -292,4 +296,102 @@ func TestTCPRelayEndToEnd(t *testing.T) {
 
 	client1.Close()
 	client2.Close()
+}
+// TestTCPImpatient tests that a client which sends data after its handshake
+// but before a partner appears receives "impatient\n" and is disconnected.
+func TestTCPImpatient(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	addr := listener.Addr().String()
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		tc := NewTransitConnection(conn, NewTransitServer(&testUsageRecorder{}, func() time.Time { return time.Now() }))
+		tc.Handle()
+	}()
+
+	client, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	// Send handshake followed by extra data in the same write, simulating
+	// a client that does not wait for the handshake to be acknowledged.
+	token := strings.Repeat("e", 64)
+	handshake := "please relay " + token + "\n"
+	_, err = client.Write([]byte(handshake + "extra bytes before partner\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(buf[:n]) != "impatient\n" {
+		t.Fatalf("expected %q, got %q", "impatient\n", buf[:n])
+	}
+}
+
+// TestWebSocketImmediateData tests that a WebSocket client which sends
+// data messages before its partner appears receives "impatient\n".
+func TestWebSocketImmediateData(t *testing.T) {
+	usage := &testUsageRecorder{}
+	server := NewTransitServer(usage, func() time.Time { return time.Now() })
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	addr := listener.Addr().String()
+
+	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		HandleWebSocket(conn, server)
+	})
+	go func() { _ = http.Serve(listener, mux) }()
+
+	token := strings.Repeat("f", 64)
+	side := strings.Repeat("3", 16)
+	url := "ws://" + addr + "/"
+
+	ws, _, err := websocket.DefaultDialer.Dial(url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.Close()
+
+	// Send handshake as first message, data as second message
+	if err := ws.WriteMessage(websocket.BinaryMessage,
+		[]byte("please relay "+token+" for side "+side)); err != nil {
+		t.Fatal(err)
+	}
+	if err := ws.WriteMessage(websocket.BinaryMessage,
+		[]byte("too early")); err != nil {
+		t.Fatal(err)
+	}
+
+	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, msg, err := ws.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(msg) != "impatient\n" {
+		t.Fatalf("expected impatient\\n, got %q", msg)
+	}
 }

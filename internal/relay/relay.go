@@ -278,7 +278,14 @@ func (tc *TransitConnection) Handle() {
 	var handshakeBuf []byte
 
 	for {
-		n, err := tc.conn.Read(buf)
+		tc.mu.Lock()
+		stateDone := tc.state == StateDone
+		conn := tc.conn
+		tc.mu.Unlock()
+		if stateDone || conn == nil {
+			return
+		}
+		n, err := conn.Read(buf)
 		if err != nil {
 			if err == io.EOF {
 				tc.connectionLost()
@@ -360,23 +367,24 @@ func (tc *TransitConnection) pleaseRelay(token string) {
 	tc.token = token
 	tc.side = ""
 	tc.mood = MoodLonely
+	// Valid handshake -> switch to raw byte reading immediately, like
+	// Python's lineReceived() calling setRawMode() before the partner
+	// is found. This is what makes "got_bytes" -> "impatient" work.
+	tc.rawMode = true
 	tc.mu.Unlock()
 
 	first := tc.server.pendingRequests.Register(token, "", tc)
 	tc.first = first
 
 	tc.mu.Lock()
-	if tc.state == StateWaitRelay {
-		if first {
+	if first {
+		// If the partner matched during Register, Register will have
+		// called gotPartner() which sets StateRelaying; otherwise wait.
+		if tc.state != StateRelaying {
 			tc.state = StateWaitPartner
-		} else {
-			// Partner already found; gotPartner() will set Relaying and rawMode.
-			// If the partner handshake beat us here, nothing to do.
-			if tc.state != StateRelaying {
-				tc.state = StateWaitPartner
-			}
 		}
 	}
+	// else we stay in StateRelaying (partner already set it)
 	tc.mu.Unlock()
 }
 
@@ -385,21 +393,20 @@ func (tc *TransitConnection) pleaseRelayForSide(token string, side PendingSide) 
 	tc.token = token
 	tc.side = side
 	tc.mood = MoodLonely
+	// Valid handshake -> switch to raw byte reading immediately.
+	tc.rawMode = true
 	tc.mu.Unlock()
 
 	first := tc.server.pendingRequests.Register(token, side, tc)
 	tc.first = first
 
 	tc.mu.Lock()
-	if tc.state == StateWaitRelay {
-		if first {
+	if first {
+		if tc.state != StateRelaying {
 			tc.state = StateWaitPartner
-		} else {
-			if tc.state != StateRelaying {
-				tc.state = StateWaitPartner
-			}
 		}
 	}
+	// else we stay in StateRelaying (partner already set it)
 	tc.mu.Unlock()
 }
 
@@ -427,75 +434,94 @@ func (tc *TransitConnection) gotPartner(other PendingClient) {
 
 func (tc *TransitConnection) partnerConnectionLost() {
 	tc.mu.Lock()
-	defer tc.mu.Unlock()
-	if tc.state == StateWaitPartner {
+	wasWaiting := tc.state == StateWaitPartner
+	if wasWaiting {
 		tc.mood = MoodRedundant
 		tc.state = StateDone
-		tc.close()
-		tc.recordUsage()
 	}
+	tc.mu.Unlock()
+	if !wasWaiting {
+		return
+	}
+	tc.close()
+	tc.recordUsage()
 }
 
 func (tc *TransitConnection) handleData(data []byte) {
 	tc.mu.Lock()
-	defer tc.mu.Unlock()
-
 	if tc.state != StateRelaying {
+		token, side := tc.token, tc.side
 		tc.mood = MoodImpatient
 		tc.state = StateDone
+		tc.mu.Unlock()
 		tc.send([]byte("impatient\n"))
 		tc.close()
-		tc.server.pendingRequests.Unregister(tc.token, tc.side, tc)
+		tc.server.pendingRequests.Unregister(token, side, tc)
 		tc.recordUsage()
 		return
 	}
+	buddy := tc.buddy
+	if buddy != nil {
+		tc.totalSent += len(data)
+	}
+	tc.mu.Unlock()
 
-	if tc.buddy == nil {
+	if buddy == nil {
 		return
 	}
-
-	tc.totalSent += len(data)
-	if other, ok := tc.buddy.(*TransitConnection); ok {
+	if other, ok := buddy.(*TransitConnection); ok {
 		other.send(data)
-	} else if wsConn, ok := tc.buddy.(*WebSocketTransitConnection); ok {
+	} else if wsConn, ok := buddy.(*WebSocketTransitConnection); ok {
 		wsConn.send(data)
 	}
 }
 
 func (tc *TransitConnection) connectionLost() {
 	tc.mu.Lock()
-	defer tc.mu.Unlock()
-
 	if tc.state == StateDone {
+		tc.mu.Unlock()
 		return
 	}
 
 	switch tc.state {
-	case StateListening, StateWaitRelay, StateWaitPartner:
-		if tc.state != StateWaitPartner {
-			tc.mood = MoodErrory
-		} else {
-			tc.mood = MoodLonely
-			tc.server.pendingRequests.Unregister(tc.token, tc.side, tc)
-		}
+	case StateListening, StateWaitRelay:
+		tc.mood = MoodErrory
+		tc.state = StateDone
+		tc.mu.Unlock()
 		tc.recordUsage()
+
+	case StateWaitPartner:
+		tc.mood = MoodLonely
+		token, side := tc.token, tc.side
+		tc.state = StateDone
+		tc.mu.Unlock()
+		tc.server.pendingRequests.Unregister(token, side, tc)
+		tc.recordUsage()
+
 	case StateRelaying:
 		if tc.first {
 			tc.mood = MoodHappy
 		} else {
 			tc.mood = MoodJilted
 		}
-		if tc.buddy != nil {
-			if other, ok := tc.buddy.(*TransitConnection); ok {
+		buddy := tc.buddy
+		token, side := tc.token, tc.side
+		tc.state = StateDone
+		tc.mu.Unlock()
+		if buddy != nil {
+			if other, ok := buddy.(*TransitConnection); ok {
 				other.close()
-			} else if wsConn, ok := tc.buddy.(*WebSocketTransitConnection); ok {
+			} else if wsConn, ok := buddy.(*WebSocketTransitConnection); ok {
 				wsConn.close()
 			}
 		}
-		tc.server.pendingRequests.Unregister(tc.token, tc.side, tc)
+		tc.server.pendingRequests.Unregister(token, side, tc)
 		tc.recordUsage()
+
+	default:
+		tc.state = StateDone
+		tc.mu.Unlock()
 	}
-	tc.state = StateDone
 }
 
 func (tc *TransitConnection) recordUsage() {
@@ -577,9 +603,13 @@ func (wsc *WebSocketTransitConnection) Handle() {
 			wsc.mu.Unlock()
 			break
 		}
+		conn := wsc.conn
 		wsc.mu.Unlock()
 
-		_, data, err := wsc.conn.ReadMessage()
+		if conn == nil {
+			return
+		}
+		_, data, err := conn.ReadMessage()
 		if err != nil {
 			wsc.connectionLost()
 			break
@@ -675,37 +705,45 @@ func (wsc *WebSocketTransitConnection) gotPartner(other PendingClient) {
 
 func (wsc *WebSocketTransitConnection) partnerConnectionLost() {
 	wsc.mu.Lock()
-	defer wsc.mu.Unlock()
-	if wsc.state == StateWaitPartner {
+	wasWaiting := wsc.state == StateWaitPartner
+	if wasWaiting {
 		wsc.mood = MoodRedundant
 		wsc.state = StateDone
-		wsc.close()
-		wsc.recordUsage()
 	}
+	wsc.mu.Unlock()
+	if !wasWaiting {
+		return
+	}
+	wsc.close()
+	wsc.recordUsage()
 }
 
 func (wsc *WebSocketTransitConnection) handleData(data []byte) {
 	wsc.mu.Lock()
-	defer wsc.mu.Unlock()
-
 	if wsc.state != StateRelaying {
+		token, side := wsc.token, wsc.side
 		wsc.mood = MoodImpatient
 		wsc.state = StateDone
+		wsc.mu.Unlock()
 		wsc.send([]byte("impatient\n"))
 		wsc.close()
-		wsc.server.pendingRequests.Unregister(wsc.token, wsc.side, wsc)
+		wsc.server.pendingRequests.Unregister(token, side, wsc)
 		wsc.recordUsage()
 		return
 	}
 
-	if wsc.buddy == nil {
+	buddy := wsc.buddy
+	if buddy != nil {
+		wsc.totalSent += len(data)
+	}
+	wsc.mu.Unlock()
+
+	if buddy == nil {
 		return
 	}
-
-	wsc.totalSent += len(data)
-	if other, ok := wsc.buddy.(*TransitConnection); ok {
+	if other, ok := buddy.(*TransitConnection); ok {
 		other.send(data)
-	} else if other, ok := wsc.buddy.(*WebSocketTransitConnection); ok {
+	} else if other, ok := buddy.(*WebSocketTransitConnection); ok {
 		other.send(data)
 	}
 }

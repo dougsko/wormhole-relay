@@ -1,0 +1,15 @@
+# Build artifacts
+wormhole-relay-bin
+*.exe
+
+# Go
+go.work
+go.work.sum
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store

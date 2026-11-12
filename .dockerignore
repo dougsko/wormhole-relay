@@ -1,0 +1,19 @@
+# keep build context small and deterministic
+.git
+.gitignore
+Dockerfile
+README.md
+
+# local build artifacts and databases
+/wormhole-relay-bin
+wormhole-relay
+*.exe
+*.sqlite
+*.sqlite-*
+*.db
+
+# editor/OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

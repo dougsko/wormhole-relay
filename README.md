@@ -106,3 +106,37 @@ go test ./...
 cmd/relay-server/   Main binary
 internal/relay/     Transit relay state machine, connection handling, usage tracking
 ```
+
+## Running in a container (podman)
+
+```sh
+podman build --format docker -t wormhole-relay .
+podman run -d --name wormhole-relay \
+    -p 4001:4001 -v wormhole-relay-data:/data \
+    wormhole-relay
+```
+
+- `--format docker` keeps the `HEALTHCHECK` (podman's default OCI image
+  format drops it; the build still succeeds without it, you just lose the
+  health probe). The probe uses busybox `nc -z` because the transit relay
+  speaks raw TCP, not HTTP.
+- The image is alpine-based and runs as non-root uid 10001. `/data` is a
+  volume holding `relay-usage.sqlite` (the default `--usage-db`).
+- Extra flags replace the default CMD entirely. To serve WebSocket clients
+  as well as raw TCP:
+
+  ```sh
+  podman run -d --name wormhole-relay \
+      -p 4001:4001 -p 4002:4002 -v wormhole-relay-data:/data \
+      wormhole-relay --port tcp:4001:interface=:: \
+      --websocket tcp:4002:interface=:: \
+      --websocket-url ws://localhost:4002/ \
+      --usage-db /data/relay-usage.sqlite
+  ```
+
+- `.dockerignore` keeps `.git`, local databases (`*.sqlite`), and editor
+  noise out of the build context.
+- Verified end-to-end: the unmodified Python client (`magic-wormhole`
+  0.24.0) completes a file transfer against the containerized relay and
+  mailbox (via `--no-listen` on both sides to force the relay path); the
+  usage DB inside `/data` records the expected `happy` row.

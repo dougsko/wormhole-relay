@@ -119,6 +119,16 @@ internal/relay/     Transit relay state machine, connection handling, usage trac
 
 ## Running in a container (podman)
 
+Pre-built multi-arch images are published to `ghcr.io/dougsko/wormhole-relay` by CI on
+every push to `main` (tag `latest` + `<git-sha>`) and on version tags (`v1.2.3` → `1.2.3`,
+`1.2`). Pull with:
+
+```sh
+podman pull ghcr.io/dougsko/wormhole-relay:latest
+```
+
+or build locally:
+
 ```sh
 podman build --format docker -t wormhole-relay .
 podman run -d --name wormhole-relay \

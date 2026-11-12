@@ -26,12 +26,12 @@ const (
 type Mood string
 
 const (
-	MoodHappy      Mood = "happy"
-	MoodLonely     Mood = "lonely"
-	MoodRedundant  Mood = "redundant"
-	MoodImpatient  Mood = "impatient"
-	MoodErrory     Mood = "errory"
-	MoodJilted     Mood = "jilted"
+	MoodHappy     Mood = "happy"
+	MoodLonely    Mood = "lonely"
+	MoodRedundant Mood = "redundant"
+	MoodImpatient Mood = "impatient"
+	MoodErrory    Mood = "errory"
+	MoodJilted    Mood = "jilted"
 )
 
 var (
@@ -43,6 +43,21 @@ var (
 
 // PendingSide represents a side token (can be empty for legacy)
 type PendingSide string
+
+// buddyMood reads the partner's current mood under its mutex.
+func buddyMood(p PendingClient) (Mood, bool) {
+	switch other := p.(type) {
+	case *TransitConnection:
+		other.mu.Lock()
+		defer other.mu.Unlock()
+		return other.mood, true
+	case *WebSocketTransitConnection:
+		other.mu.Lock()
+		defer other.mu.Unlock()
+		return other.mood, true
+	}
+	return "", false
+}
 
 // PendingClient is the common interface used by pending request tracking
 type PendingClient interface {
@@ -525,6 +540,15 @@ func (tc *TransitConnection) connectionLost() {
 }
 
 func (tc *TransitConnection) recordUsage() {
+	// Like Python's _record_usage: skip the "jilted" event when the
+	// partner ended happy, so each relayed transfer produces exactly
+	// one usage record.
+	if tc.mood == MoodJilted {
+		if m, ok := buddyMood(tc.buddy); ok && m == MoodHappy {
+			return
+		}
+	}
+
 	buddyStarted := time.Time{}
 	buddyBytes := 0
 	if tc.buddy != nil {
@@ -549,14 +573,14 @@ func (tc *TransitConnection) recordUsage() {
 
 // WebSocketTransitConnection handles WebSocket connections
 type WebSocketTransitConnection struct {
-	conn     *websocket.Conn
-	server   *TransitServer
-	state    TransitServerState
-	token    string
-	side     PendingSide
-	first    bool
-	mood     Mood
-	buddy    PendingClient
+	conn      *websocket.Conn
+	server    *TransitServer
+	state     TransitServerState
+	token     string
+	side      PendingSide
+	first     bool
+	mood      Mood
+	buddy     PendingClient
 	totalSent int
 	started   time.Time
 	firstMsg  bool
@@ -785,6 +809,15 @@ func (wsc *WebSocketTransitConnection) connectionLost() {
 }
 
 func (wsc *WebSocketTransitConnection) recordUsage() {
+	// Like Python's _record_usage: skip the "jilted" event when the
+	// partner ended happy, so each relayed transfer produces exactly
+	// one usage record.
+	if wsc.mood == MoodJilted {
+		if m, ok := buddyMood(wsc.buddy); ok && m == MoodHappy {
+			return
+		}
+	}
+
 	buddyStarted := time.Time{}
 	buddyBytes := 0
 	if wsc.buddy != nil {

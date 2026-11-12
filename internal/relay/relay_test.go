@@ -2,9 +2,11 @@ package relay
 
 import (
 	"bytes"
+	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -203,13 +205,32 @@ func TestRelayRegexes(t *testing.T) {
 	}
 }
 
+// testUsageEvent captures a recorded usage event for test assertions
+type testUsageEvent struct {
+	mood       Mood
+	bytesSent  int
+	buddyBytes int
+}
+
 // testUsageRecorder is a simple usage recorder for tests
-type testUsageRecorder struct{}
+type testUsageRecorder struct {
+	mu     sync.Mutex
+	events []testUsageEvent
+}
 
 func (r *testUsageRecorder) Record(started, buddyStarted time.Time, mood Mood, bytesSent, buddyBytes int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, testUsageEvent{mood: mood, bytesSent: bytesSent, buddyBytes: buddyBytes})
 }
 
 func (r *testUsageRecorder) UpdateStats(rebooted, updated time.Time, connected, waiting, incompleteBytes int) {
+}
+
+func (r *testUsageRecorder) snapshot() []testUsageEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]testUsageEvent{}, r.events...)
 }
 
 // TestTCPRelayEndToEnd tests the full relay flow with real TCP sockets
@@ -297,6 +318,7 @@ func TestTCPRelayEndToEnd(t *testing.T) {
 	client1.Close()
 	client2.Close()
 }
+
 // TestTCPImpatient tests that a client which sends data after its handshake
 // but before a partner appears receives "impatient\n" and is disconnected.
 func TestTCPImpatient(t *testing.T) {
@@ -393,5 +415,114 @@ func TestWebSocketImmediateData(t *testing.T) {
 	}
 	if string(msg) != "impatient\n" {
 		t.Fatalf("expected impatient\\n, got %q", msg)
+	}
+}
+
+// TestJiltedUsageRecordSuppressed mirrors the Python reference test
+// test_one_happy_one_jilted: when a paired connection ends, exactly one
+// usage record is emitted (the "happy" one) - the side whose partner
+// went happy is not recorded.
+func TestJiltedUsageRecordSuppressed(t *testing.T) {
+	for _, disconnectFirst := range []string{"first", "second"} {
+		t.Run(disconnectFirst, func(t *testing.T) {
+			usage := &testUsageRecorder{}
+			server := NewTransitServer(usage, func() time.Time { return time.Now() })
+
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer listener.Close()
+			addr := listener.Addr().String()
+
+			go func() {
+				for i := 0; i < 2; i++ {
+					conn, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					go HandleTCPConnection(conn, server)
+				}
+			}()
+
+			token := strings.Repeat("b", 64)
+			side1 := strings.Repeat("1", 16)
+			side2 := strings.Repeat("2", 16)
+
+			client1, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client1.Close()
+			client2, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client2.Close()
+
+			if _, err := client1.Write([]byte("please relay " + token + " for side " + side1 + "\n")); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client2.Write([]byte("please relay " + token + " for side " + side2 + "\n")); err != nil {
+				t.Fatal(err)
+			}
+
+			readOK := func(c net.Conn) {
+				c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				buf := make([]byte, 3)
+				if _, err := io.ReadFull(c, buf); err != nil {
+					t.Fatalf("read ok: %v", err)
+				}
+				if string(buf) != "ok\n" {
+					t.Fatalf("expected ok\\n, got %q", buf)
+				}
+			}
+			readOK(client1)
+			readOK(client2)
+
+			// client1 sends 13 bytes, client2 sends 7 bytes
+			if _, err := client1.Write(bytes.Repeat([]byte("a"), 13)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client2.Write(bytes.Repeat([]byte("b"), 7)); err != nil {
+				t.Fatal(err)
+			}
+			drain := func(c net.Conn, n int) {
+				c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				if _, err := io.ReadFull(c, make([]byte, n)); err != nil {
+					t.Fatalf("drain %d bytes: %v", n, err)
+				}
+			}
+			drain(client2, 13)
+			drain(client1, 7)
+
+			if disconnectFirst == "first" {
+				client1.Close()
+			} else {
+				client2.Close()
+			}
+
+			// Allow both connection_lost paths (the one disconnecting and the
+			// partner it takes down) to run.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if len(usage.snapshot()) >= 1 {
+					time.Sleep(300 * time.Millisecond)
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			events := usage.snapshot()
+			if len(events) != 1 {
+				t.Fatalf("expected exactly 1 usage event, got %d: %+v", len(events), events)
+			}
+			if events[0].mood != MoodHappy {
+				t.Fatalf("expected mood happy, got %s", events[0].mood)
+			}
+			if events[0].bytesSent+events[0].buddyBytes != 20 {
+				t.Fatalf("expected 20 total bytes, got %+v", events[0])
+			}
+		})
 	}
 }

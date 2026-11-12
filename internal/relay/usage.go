@@ -77,11 +77,11 @@ func (ut *UsageTracker) Record(started, buddyStarted time.Time, mood Mood, bytes
 	}
 
 	ut.notifyBackends(map[string]interface{}{
-		"started":       started,
-		"total_time":    totalTime,
-		"waiting_time":  waitingTime,
-		"total_bytes":   totalBytes,
-		"mood":          string(mood),
+		"started":      started,
+		"total_time":   totalTime,
+		"waiting_time": waitingTime,
+		"total_bytes":  totalBytes,
+		"mood":         string(mood),
 	})
 }
 

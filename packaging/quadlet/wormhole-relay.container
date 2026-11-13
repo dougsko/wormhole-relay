@@ -1,0 +1,20 @@
+[Unit]
+Description=Magic Wormhole transit relay
+
+[Container]
+Image=ghcr.io/dougsko/wormhole-relay:latest
+ContainerName=wormhole-relay
+Exec=--port tcp:4001:interface=:: --usage-db /data/relay-usage.sqlite
+PublishPort=4001:4001
+# The named volume is created automatically on first start.
+Volume=wormhole-relay-data:/data:Z
+AutoUpdate=registry
+NoNewPrivileges=true
+DropCapability=ALL
+ReadOnlyTmpfs=true
+
+[Service]
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

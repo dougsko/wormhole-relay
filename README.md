@@ -174,6 +174,46 @@ podman run -d --name wormhole-relay \
   mailbox (via `--no-listen` on both sides to force the relay path); the
   usage DB inside `/data` records the expected `happy` row.
 
+## Running with Podman Quadlet
+
+Quadlet files are provided under `packaging/quadlet/` for easy deployment as
+systemd services using Podman. They pull the published image and use a
+named `wormhole-relay-data` volume, publish raw TCP port
+4001, and start the container on boot via the generated systemd unit.
+
+Rootful installation:
+
+```sh
+sudo cp packaging/quadlet/*.container /etc/containers/systemd/
+sudo systemctl daemon-reload
+sudo systemctl start wormhole-relay.service
+```
+
+Rootless installation:
+
+```sh
+mkdir -p ~/.config/containers/systemd
+cp packaging/quadlet/*.container ~/.config/containers/systemd/
+systemctl --user daemon-reload
+systemctl --user start wormhole-relay.service
+loginctl enable-linger "$USER"   # if it should start before login
+```
+
+The generated units have an `[Install]` section, so no separate
+`systemctl enable` is needed. Logs are available with:
+
+```sh
+sudo journalctl -u wormhole-relay.service -f      # rootful
+journalctl --user -u wormhole-relay.service -f    # rootless
+```
+
+The default `Exec=` is
+`--port tcp:4001:interface=:: --usage-db /data/relay-usage.sqlite`. To also
+serve WebSocket transit clients, add `--websocket tcp:4002:interface=::` to
+`Exec=`, publish `4002:4002`, and set `--websocket-url` if needed. Ensure host
+TCP port 4001 is open in the firewall if accessed over the internet. Desktop
+Magic Wormhole clients generally use the raw `tcp:HOST:4001` transit helper.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). This is a Go port of the MIT-licensed Python

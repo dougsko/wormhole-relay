@@ -13,3 +13,15 @@ go.work.sum
 
 # OS
 .DS_Store
+
+# Binaries and local test artifacts
+/wormhole-relay
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-backup-v*
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

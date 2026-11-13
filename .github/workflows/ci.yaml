@@ -46,7 +46,11 @@ jobs:
           path: wormhole-william
       - uses: actions/setup-go@v5
         with:
-          go-version-file: wormhole-relay/go.mod
+          # wormhole-mailbox/go.mod declares the highest go directive
+          # (go 1.26.8); the suite builds the sibling mailbox-server from
+          # source inside the tests, so install at least that version and
+          # avoid a surprise toolchain download mid-test
+          go-version-file: wormhole-mailbox/go.mod
           cache: true
           cache-dependency-path: |
             wormhole-relay/go.sum
@@ -60,7 +64,7 @@ jobs:
       - working-directory: wormhole-relay/e2e
         env:
           WORMHOLE_E2E_REQUIRE: '1'
-        run: go test -tags=e2e -v -timeout 300s .
+        run: go test -tags=e2e -v -count=1 -timeout 300s .
 
   image:
     needs: [test, e2e]

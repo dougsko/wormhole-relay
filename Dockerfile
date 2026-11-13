@@ -23,21 +23,30 @@
 #       --websocket-url ws://localhost:4002/ \
 #       --usage-db /data/relay-usage.sqlite
 
-FROM docker.io/library/golang:1.26-alpine AS build
+# Cross-compiling on the native build platform means the arm64 image needs
+# no QEMU emulation, so builds behave the same on CI and local machines.
+FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.26-alpine AS build
 WORKDIR /src
+# TARGETOS/TARGETARCH are provided automatically by buildx (and by podman
+# build --platform); default to linux/amd64 when building without them
+ARG TARGETOS TARGETARCH
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" \
-    -o /out/wormhole-relay ./cmd/relay-server
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-amd64} go build -trimpath -ldflags="-s -w" \
+    -o /out/wormhole-relay ./cmd/relay-server \
+    && adduser -D -u 10001 wormhole \
+    && mkdir -p /data \
+    && chown 10001:10001 /data
 
 FROM docker.io/library/alpine:3.21
 LABEL org.opencontainers.image.source="https://github.com/dougsko/wormhole-relay" \
       org.opencontainers.image.description="Go port of magic-wormhole-transit-relay (transit relay)" \
       org.opencontainers.image.licenses="MIT"
-RUN adduser -D -u 10001 wormhole \
-    && mkdir -p /data \
-    && chown wormhole:wormhole /data
+# /etc/passwd and /etc/group bring in the wormhole user (uid 10001); they were
+# prepared on the build platform as plain text, so no arm64 binary runs here
+COPY --from=build /etc/passwd /etc/group /etc/
+COPY --from=build --chown=10001:10001 /data /data
 COPY --from=build /out/wormhole-relay /usr/local/bin/wormhole-relay
 USER wormhole
 VOLUME ["/data"]

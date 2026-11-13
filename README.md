@@ -107,8 +107,21 @@ wormhole receive --no-listen --accept-file --output-file OUT CODE
 ## Running tests
 
 ```sh
-go test ./...
+go test ./...            # unit tests (protocol machine, pairing, usage db, websocket transit)
+go test ./... -race      # race detector
 ```
+
+Automated interoperability suite (Python magic-wormhole client and the wormhole-william
+Go library, against a real `relay-server` binary with Go mailbox as rendezvous; both
+sides forced through the relay with `--no-listen`; sha256-verified; relay usage DB
+checked for the `happy` pairing):
+
+```sh
+cd e2e && go test -tags=e2e -v .
+```
+
+See [e2e/README.md](e2e/README.md) for requirements and the environment knobs.
+Runs in CI as the `e2e` job.
 
 ## Project layout
 

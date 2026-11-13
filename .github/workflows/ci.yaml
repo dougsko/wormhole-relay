@@ -27,8 +27,43 @@ jobs:
       - run: go vet ./...
       - run: go test ./...
 
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      # all three repositories, checked out as siblings
+      # (e2e/go.mod uses a replace directive pointing at ../../wormhole-william,
+      #  and the suite builds the mailbox-server from ../../wormhole-mailbox)
+      - uses: actions/checkout@v4
+        with:
+          path: wormhole-relay
+      - uses: actions/checkout@v4
+        with:
+          repository: dougsko/wormhole-mailbox
+          path: wormhole-mailbox
+      - uses: actions/checkout@v4
+        with:
+          repository: dougsko/wormhole-william
+          path: wormhole-william
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wormhole-relay/go.mod
+          cache: true
+          cache-dependency-path: |
+            wormhole-relay/go.sum
+            wormhole-relay/e2e/go.sum
+            wormhole-mailbox/go.sum
+            wormhole-william/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install magic-wormhole
+      - working-directory: wormhole-relay/e2e
+        env:
+          WORMHOLE_E2E_REQUIRE: '1'
+        run: go test -tags=e2e -v -timeout 300s .
+
   image:
-    needs: test
+    needs: [test, e2e]
     # only publish on pushes (not on PRs); the image is pushed as linux/amd64 and linux/arm64
     if: github.event_name == 'push'
     runs-on: ubuntu-latest

@@ -109,7 +109,15 @@ wormhole receive --no-listen --accept-file --output-file OUT CODE
 ```sh
 go test ./...            # unit tests (protocol machine, pairing, usage db, websocket transit)
 go test ./... -race      # race detector
+
+# benchmarks and load generator (see PERFORMANCE.md)
+go test ./internal/relay -run XXX -bench . -benchmem
+go build -o relay-stress ./cmd/relay-stress
 ```
+
+See [PERFORMANCE.md](PERFORMANCE.md) for the benchmark suite, the
+protocol-level stress tool, an A/B comparison method against the Python
+reference relay, and baseline numbers.
 
 Automated interoperability suite (Python magic-wormhole client and the wormhole-william
 Go library, against a real `relay-server` binary with Go mailbox as rendezvous; both

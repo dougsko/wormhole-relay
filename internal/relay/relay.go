@@ -2,7 +2,6 @@ package relay
 
 import (
 	"bytes"
-	"io"
 	"net"
 	"regexp"
 	"sync"
@@ -304,9 +303,7 @@ func (tc *TransitConnection) Handle() {
 		}
 		n, err := conn.Read(buf)
 		if err != nil {
-			if err == io.EOF {
-				tc.connectionLost()
-			}
+			// the deferred connectionLost handles all cleanup
 			break
 		}
 		if n == 0 {
@@ -494,6 +491,9 @@ func (tc *TransitConnection) handleData(data []byte) {
 }
 
 func (tc *TransitConnection) connectionLost() {
+	// Close our own side exactly once; nothing else does this on teardown.
+	tc.close()
+
 	tc.mu.Lock()
 	if tc.state == StateDone {
 		tc.mu.Unlock()
@@ -647,7 +647,7 @@ func (wsc *WebSocketTransitConnection) Handle() {
 		}
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			wsc.connectionLost()
+			// the deferred connectionLost handles all cleanup
 			break
 		}
 		wsc.handleDataOrHandshake(data)
@@ -785,6 +785,9 @@ func (wsc *WebSocketTransitConnection) handleData(data []byte) {
 }
 
 func (wsc *WebSocketTransitConnection) connectionLost() {
+	// Close our own side exactly once; nothing else does this on teardown.
+	wsc.close()
+
 	wsc.mu.Lock()
 	defer wsc.mu.Unlock()
 

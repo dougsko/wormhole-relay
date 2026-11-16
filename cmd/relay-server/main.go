@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -27,6 +28,23 @@ type Config struct {
 	BlurUsage    int
 	LogFD        string
 	UsageDB      string
+}
+
+// noDelayListener sets TCP_NODELAY on accepted connections. The relay
+// forwards many small messages (handshakes, "ok\n", small frames), where
+// Nagle/delayed-ACK interaction adds tens of milliseconds per message.
+type noDelayListener struct {
+	net.Listener
+}
+
+func (l noDelayListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err == nil {
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetNoDelay(true)
+		}
+	}
+	return conn, err
 }
 
 // listenEndpoint is a resolved listen address and its port.
@@ -131,6 +149,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to listen on TCP %s: %v", tcpEndpoint.addr, err)
 	}
+	tcpListener := noDelayListener{listener}
 
 	// Setup WebSocket listener if configured
 	var wsListener net.Listener
@@ -160,7 +179,8 @@ func main() {
 		upgrader := websocket.Upgrader{
 			CheckOrigin: func(r *http.Request) bool { return true },
 		}
-		http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 			conn, err := upgrader.Upgrade(w, r, nil)
 			if err != nil {
 				log.Printf("WebSocket upgrade failed: %v", err)
@@ -168,8 +188,13 @@ func main() {
 			}
 			relay.HandleWebSocket(conn, transit)
 		})
+		server := &http.Server{
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
 		go func() {
-			if err := http.Serve(wsListener, nil); err != nil && err != http.ErrServerClosed {
+			if err := server.Serve(noDelayListener{wsListener}); err != nil && err != http.ErrServerClosed {
 				log.Fatalf("WebSocket server failed: %v", err)
 			}
 		}()
@@ -187,13 +212,30 @@ func main() {
 		}
 	}()
 
-	// Accept TCP connections
+	// Accept TCP connections. Back off on repeated accept failures (e.g.
+	// fd exhaustion) instead of busy-spinning; fatal only if the listener
+	// itself is gone.
+	var acceptErrors int
 	for {
-		conn, err := listener.Accept()
+		conn, err := tcpListener.Accept()
 		if err != nil {
-			log.Printf("TCP accept error: %v", err)
+			if errors.Is(err, net.ErrClosed) {
+				log.Fatalf("TCP listener closed: %v", err)
+			}
+			acceptErrors++
+			shift := uint(acceptErrors - 1)
+			if shift > 8 {
+				shift = 8
+			}
+			backoff := time.Duration(5<<shift) * time.Millisecond
+			if backoff > time.Second {
+				backoff = time.Second
+			}
+			log.Printf("TCP accept error (%d consecutive): %v; retrying in %s", acceptErrors, err, backoff)
+			time.Sleep(backoff)
 			continue
 		}
+		acceptErrors = 0
 		go relay.HandleTCPConnection(conn, transit)
 	}
 }

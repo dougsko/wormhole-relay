@@ -2,8 +2,10 @@ package relay
 
 import (
 	"bytes"
+	"log"
 	"net"
 	"regexp"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -43,6 +45,9 @@ const (
 var (
 	preHandshakeReadTimeout = 30 * time.Second
 	writeTimeout            = 30 * time.Second
+	// closeWriteTimeout bounds the best-effort Close frame sent when a
+	// WebSocket tears down; a wedged peer must not hold the goroutine.
+	closeWriteTimeout = 5 * time.Second
 )
 
 const maxHandshakeBytes = 1024
@@ -299,8 +304,15 @@ func (tc *TransitConnection) send(data []byte) {
 	tc.mu.Lock()
 	conn := tc.conn
 	tc.mu.Unlock()
-	if conn != nil {
-		conn.Write(data)
+	if conn == nil {
+		return
+	}
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	if _, err := conn.Write(data); err != nil {
+		log.Printf("transit: write to peer failed: %v", err)
+		// the peer is wedged; close our side so the read loop exits
+		// and connectionLost tears down both ends
+		tc.close()
 	}
 }
 
@@ -627,7 +639,8 @@ type WebSocketTransitConnection struct {
 	totalSent int
 	started   time.Time
 	firstMsg  bool
-	mu        sync.Mutex
+	mu        sync.Mutex // guards state fields
+	wmu       sync.Mutex // serializes WriteMessage calls (gorilla requires this)
 }
 
 // NewWebSocketTransitConnection creates a new WebSocket transit connection
@@ -653,8 +666,17 @@ func (wsc *WebSocketTransitConnection) send(data []byte) {
 	wsc.mu.Lock()
 	conn := wsc.conn
 	wsc.mu.Unlock()
-	if conn != nil {
-		conn.WriteMessage(websocket.BinaryMessage, data)
+	if conn == nil {
+		return
+	}
+	wsc.wmu.Lock()
+	_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := conn.WriteMessage(websocket.BinaryMessage, data)
+	wsc.wmu.Unlock()
+	if err != nil {
+		log.Printf("transit: write to websocket peer failed: %v", err)
+		// close our side; connectionLost tears down and records
+		wsc.close()
 	}
 }
 
@@ -664,8 +686,11 @@ func (wsc *WebSocketTransitConnection) close() {
 	wsc.conn = nil
 	wsc.mu.Unlock()
 	if conn != nil {
-		conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
-		conn.Close()
+		wsc.wmu.Lock()
+		_ = conn.SetWriteDeadline(time.Now().Add(closeWriteTimeout))
+		_ = conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		wsc.wmu.Unlock()
+		_ = conn.Close()
 	}
 }
 
@@ -903,12 +928,24 @@ func (wsc *WebSocketTransitConnection) recordUsage() {
 
 // HandleTCPConnection handles a TCP connection
 func HandleTCPConnection(conn net.Conn, transit *TransitServer) {
+	// A panic in one connection must never take down the whole relay;
+	// log and fall through to connectionLost via Handle's own defer.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("relay: panic in TCP connection handler: %v\n%s", r, debug.Stack())
+		}
+	}()
 	tc := NewTransitConnection(conn, transit)
 	tc.Handle()
 }
 
 // HandleWebSocket handles a WebSocket connection
 func HandleWebSocket(conn *websocket.Conn, transit *TransitServer) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("relay: panic in WebSocket connection handler: %v\n%s", r, debug.Stack())
+		}
+	}()
 	wsc := NewWebSocketTransitConnection(conn, transit)
 	wsc.Handle()
 }

@@ -37,7 +37,7 @@ type benchPendingClient struct{ id uint64 }
 
 func (benchPendingClient) partnerConnectionLost()         {}
 func (benchPendingClient) gotPartner(other PendingClient) {}
-func (benchPendingClient) buddyStats() (time.Time, int) { return time.Time{}, 0 }
+func (benchPendingClient) buddyStats() (time.Time, int)   { return time.Time{}, 0 }
 
 // setupRelayBenchServer starts a TransitServer on a loopback listener and
 // returns its address. Callers dial pairs of clients and handshake them.

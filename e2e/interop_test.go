@@ -356,7 +356,7 @@ func goClient(s *stack) *wormhole.Client {
 		RendezvousURL:       s.relayURL,
 		TransitRelayAddress: s.transitAddr,
 		// no local listening socket: the relay is the only transit path
-		NoListen:                 true,
+		NoListen:                  true,
 		PassPhraseComponentLength: 2,
 	}
 }
@@ -476,42 +476,35 @@ func compareTrees(t *testing.T, want, got map[string]string) {
 // ---------- relay usage DB assertion ----------
 
 type usageRow struct {
-	result    string
+	result     string
 	totalBytes int64
 }
 
-// usageRows polls the relay's usage database until at least one usage
-// record shows up (the record is written when the connection closes) or
-// the deadline passes. Returns all rows found.
-func usageRows(t *testing.T, path string, d time.Duration) []usageRow {
+// usageRowsOnce queries the relay's usage database without waiting;
+// returns nil while the database does not exist yet.
+func usageRowsOnce(t *testing.T, path string) []usageRow {
 	t.Helper()
-	deadline := time.Now().Add(d)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(1000)")
-		if err == nil {
-			rows, qerr := db.Query("SELECT result, total_bytes FROM usage")
-			var out []usageRow
-			if qerr == nil {
-				for rows.Next() {
-					var r usageRow
-					if err := rows.Scan(&r.result, &r.totalBytes); err == nil {
-						out = append(out, r)
-					}
-				}
-				_ = rows.Close()
-			}
-			_ = db.Close()
-			if len(out) > 0 {
-				return out
-			}
-		}
-		time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(path); err != nil {
+		return nil
 	}
-	return nil
+	db, err := sql.Open("sqlite", "file:"+path+"?mode=ro&_pragma=busy_timeout(1000)")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = db.Close() }()
+	rows, err := db.Query("SELECT result, total_bytes FROM usage")
+	if err != nil {
+		return nil
+	}
+	defer func() { _ = rows.Close() }()
+	var out []usageRow
+	for rows.Next() {
+		var r usageRow
+		if err := rows.Scan(&r.result, &r.totalBytes); err == nil {
+			out = append(out, r)
+		}
+	}
+	return out
 }
 
 // requireHappyPairing asserts the relay recorded at least one 'happy'
@@ -519,13 +512,22 @@ func usageRows(t *testing.T, path string, d time.Duration) []usageRow {
 // the Go relay and not some other path.
 func requireHappyPairing(t *testing.T, s *stack, minBytes int64) {
 	t.Helper()
-	rows := usageRows(t, s.usageDB, 10*time.Second)
-	for _, r := range rows {
-		if r.result == "happy" && r.totalBytes >= minBytes {
-			return
+	// The relay records usage asynchronously (batched flushes), so poll
+	// until a qualifying happy row appears instead of snapshotting once:
+	// an early "empty" row from a short-lived connection would satisfy a
+	// naive first-non-empty check before the pairing record lands.
+	deadline := time.Now().Add(10 * time.Second)
+	var last []usageRow
+	for time.Now().Before(deadline) {
+		last = usageRowsOnce(t, s.usageDB)
+		for _, r := range last {
+			if r.result == "happy" && r.totalBytes >= minBytes {
+				return
+			}
 		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	t.Fatalf("expected a 'happy' pairing in the relay usage db with >= %d bytes relayed; rows: %v", minBytes, rows)
+	t.Fatalf("expected a 'happy' pairing in the relay usage db with >= %d bytes relayed; rows: %v", minBytes, last)
 }
 
 // ---------- Go -> Python (via the Go relay) ----------

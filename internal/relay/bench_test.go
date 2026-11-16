@@ -225,10 +225,46 @@ func BenchmarkUsageRecord(b *testing.B) {
 		if err != nil {
 			b.Fatal(err)
 		}
+		// measures only the enqueue cost on the caller's goroutine;
+		// the background worker drains concurrently
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
 			tracker.Record(started, started, MoodHappy, 12345, 54321)
 		}
+		b.StopTimer()
+		tracker.Flush()
+		tracker.Close()
+	})
+	b.Run("sqlite_memory_sync_flush", func(b *testing.B) {
+		tracker, err := CreateUsageTracker(0, "", ":memory:")
+		if err != nil {
+			b.Fatal(err)
+		}
+		// approximates the old synchronous path: record + wait for the
+		// batch to hit the database each iteration
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			tracker.Record(started, started, MoodHappy, 12345, 54321)
+			tracker.Flush()
+		}
+		tracker.Close()
+	})
+	b.Run("sqlite_memory_batch64", func(b *testing.B) {
+		tracker, err := CreateUsageTracker(0, "", ":memory:")
+		if err != nil {
+			b.Fatal(err)
+		}
+		// approximates production: one transaction per 64 records
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			tracker.Record(started, started, MoodHappy, 12345, 54321)
+			if i%64 == 63 {
+				tracker.Flush()
+			}
+		}
+		b.StopTimer()
+		tracker.Flush()
+		tracker.Close()
 	})
 	b.Run("no_backends_blurred", func(b *testing.B) {
 		tracker, err := CreateUsageTracker(3600, "", "")

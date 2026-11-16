@@ -19,6 +19,7 @@ func TestUsageDBCreateRecordAndStats(t *testing.T) {
 	started := time.Unix(1794506000, 0)
 	buddyStarted := started.Add(3 * time.Second)
 	tracker.Record(started, buddyStarted, MoodHappy, 100, 200)
+	tracker.Flush()
 
 	db, err := OpenUsageDB(usageFile)
 	if err != nil {
@@ -52,6 +53,7 @@ func TestUsageDBCreateRecordAndStats(t *testing.T) {
 
 	// lonely: no buddy, waiting_time must be NULL
 	tracker.Record(started, time.Time{}, MoodLonely, 0, 0)
+	tracker.Flush()
 	var waiting interface{}
 	if err := db.QueryRow("SELECT `waiting_time` FROM `usage` WHERE `result`='lonely'").Scan(&waiting); err != nil {
 		t.Fatal(err)
@@ -99,6 +101,7 @@ func TestUsageDBBlur(t *testing.T) {
 	}
 	started := time.Unix(1794506123, 0) // not a multiple of 100
 	tracker.Record(started, time.Time{}, MoodLonely, 0, 0)
+	tracker.Flush()
 
 	db, err := OpenUsageDB(usageFile)
 	if err != nil {

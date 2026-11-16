@@ -83,6 +83,9 @@ type PendingClient interface {
 	partnerConnectionLost()
 	// gotPartner is called when a matching partner is found
 	gotPartner(other PendingClient)
+	// buddyStats snapshots the fields recordUsage needs from a partner
+	// (under the partner's mutex; the buddy may be mutating totalSent)
+	buddyStats() (started time.Time, totalSent int)
 }
 
 // ActiveConnections tracks active (paired) connections
@@ -284,6 +287,12 @@ func NewTransitConnection(conn net.Conn, server *TransitServer) *TransitConnecti
 		mood:    MoodEmpty,
 		started: server.getTimestamp(),
 	}
+}
+
+func (tc *TransitConnection) buddyStats() (time.Time, int) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	return tc.started, tc.totalSent
 }
 
 func (tc *TransitConnection) send(data []byte) {
@@ -593,14 +602,7 @@ func (tc *TransitConnection) recordUsage() {
 	buddyStarted := time.Time{}
 	buddyBytes := 0
 	if tc.buddy != nil {
-		switch other := tc.buddy.(type) {
-		case *TransitConnection:
-			buddyStarted = other.started
-			buddyBytes = other.totalSent
-		case *WebSocketTransitConnection:
-			buddyStarted = other.started
-			buddyBytes = other.totalSent
-		}
+		buddyStarted, buddyBytes = tc.buddy.buddyStats()
 	}
 
 	tc.server.usage.Record(
@@ -639,6 +641,12 @@ func NewWebSocketTransitConnection(conn *websocket.Conn, server *TransitServer) 
 		started:  server.getTimestamp(),
 		firstMsg: true,
 	}
+}
+
+func (wsc *WebSocketTransitConnection) buddyStats() (time.Time, int) {
+	wsc.mu.Lock()
+	defer wsc.mu.Unlock()
+	return wsc.started, wsc.totalSent
 }
 
 func (wsc *WebSocketTransitConnection) send(data []byte) {
@@ -881,14 +889,7 @@ func (wsc *WebSocketTransitConnection) recordUsage() {
 	buddyStarted := time.Time{}
 	buddyBytes := 0
 	if wsc.buddy != nil {
-		switch other := wsc.buddy.(type) {
-		case *TransitConnection:
-			buddyStarted = other.started
-			buddyBytes = other.totalSent
-		case *WebSocketTransitConnection:
-			buddyStarted = other.started
-			buddyBytes = other.totalSent
-		}
+		buddyStarted, buddyBytes = wsc.buddy.buddyStats()
 	}
 
 	wsc.server.usage.Record(

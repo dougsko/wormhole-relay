@@ -34,6 +34,24 @@ const (
 	MoodJilted    Mood = "jilted"
 )
 
+// Timeouts are vars so tests can shrink them. preHandshakeReadTimeout
+// bounds how long a client may take to deliver its handshake line: idle
+// or trickling clients can't park a goroutine and fd forever. It does not
+// apply after the handshake, when a paired transfer may be idle between
+// messages. writeTimeout bounds a single socket write so a stalled peer
+// can't leak the relay's goroutines; exceeded writes tear the pipe down.
+var (
+	preHandshakeReadTimeout = 30 * time.Second
+	writeTimeout            = 30 * time.Second
+)
+
+const maxHandshakeBytes = 1024
+
+// maxWSMessageBytes caps a single WebSocket frame the relay will buffer.
+// Transit dataframes are far smaller; this exists so a hostile client
+// can't exhaust memory.
+const maxWSMessageBytes = 4 << 20
+
 var (
 	// old: "please relay {64}\n"
 	oldRelayRe = regexp.MustCompile(`^please relay (\w{64})$`)
@@ -292,15 +310,28 @@ func (tc *TransitConnection) Handle() {
 	defer tc.connectionLost()
 	buf := make([]byte, 65536)
 	var handshakeBuf []byte
+	readDeadlineSet := false
 
 	for {
 		tc.mu.Lock()
 		stateDone := tc.state == StateDone
 		conn := tc.conn
+		raw := tc.rawMode
 		tc.mu.Unlock()
 		if stateDone || conn == nil {
 			return
 		}
+
+		// Pre-handshake reads get a deadline; clear it once we enter raw
+		// mode. Only transitions touch the deadline, not every read.
+		if raw && readDeadlineSet {
+			_ = conn.SetReadDeadline(time.Time{})
+			readDeadlineSet = false
+		} else if !raw && !readDeadlineSet {
+			_ = conn.SetReadDeadline(time.Now().Add(preHandshakeReadTimeout))
+			readDeadlineSet = true
+		}
+
 		n, err := conn.Read(buf)
 		if err != nil {
 			// the deferred connectionLost handles all cleanup
@@ -309,12 +340,12 @@ func (tc *TransitConnection) Handle() {
 		if n == 0 {
 			continue
 		}
-		chunk := append([]byte{}, buf[:n]...)
+		chunk := buf[:n] // consumed synchronously below; no copy needed
 
 		// Re-check raw mode now that we have data, because
 		// gotPartner may have flipped it since last iteration.
 		tc.mu.Lock()
-		raw := tc.rawMode
+		raw = tc.rawMode
 		tc.mu.Unlock()
 
 		if raw {
@@ -323,16 +354,20 @@ func (tc *TransitConnection) Handle() {
 		}
 
 		// Pre-handshake: accumulate bytes until we see a newline
-		// (or until rawMode flips).
+		// (or until rawMode flips). A handshake line is ~105 bytes;
+		// anything beyond maxHandshakeBytes is rejected.
 		handshakeBuf = append(handshakeBuf, chunk...)
+		if len(handshakeBuf) > maxHandshakeBytes {
+			tc.badToken()
+			return
+		}
 		for {
 			idx := bytes.IndexByte(handshakeBuf, '\n')
 			if idx == -1 {
 				break
 			}
-			line := append([]byte{}, handshakeBuf[:idx]...)
-			rest := append([]byte{}, handshakeBuf[idx+1:]...)
-			handshakeBuf = rest
+			line := handshakeBuf[:idx]
+			handshakeBuf = handshakeBuf[idx+1:]
 
 			tc.handleLine(bytes.TrimSpace(line))
 
@@ -340,20 +375,15 @@ func (tc *TransitConnection) Handle() {
 			tc.mu.Lock()
 			stateDone := tc.state == StateDone
 			raw = tc.rawMode
-			rcBuffer := append([]byte{}, handshakeBuf...)
+			rest := handshakeBuf
 			handshakeBuf = nil
 			tc.mu.Unlock()
 
-			if stateDone {
-				// flush remaining raw data as bytes if we switched to raw,
-				// otherwise drop it
-				if raw && len(rcBuffer) > 0 {
-					tc.handleData(rcBuffer)
-				}
-				return
+			if raw && len(rest) > 0 {
+				tc.handleData(rest)
 			}
-			if raw && len(rcBuffer) > 0 {
-				tc.handleData(rcBuffer)
+			if stateDone {
+				return
 			}
 		}
 	}
@@ -600,6 +630,7 @@ type WebSocketTransitConnection struct {
 
 // NewWebSocketTransitConnection creates a new WebSocket transit connection
 func NewWebSocketTransitConnection(conn *websocket.Conn, server *TransitServer) *WebSocketTransitConnection {
+	conn.SetReadLimit(maxWSMessageBytes)
 	return &WebSocketTransitConnection{
 		conn:     conn,
 		server:   server,
@@ -633,6 +664,7 @@ func (wsc *WebSocketTransitConnection) close() {
 // Handle runs the WebSocket connection state machine
 func (wsc *WebSocketTransitConnection) Handle() {
 	defer wsc.connectionLost()
+	readDeadlineSet := false
 	for {
 		wsc.mu.Lock()
 		if wsc.state == StateDone {
@@ -640,11 +672,23 @@ func (wsc *WebSocketTransitConnection) Handle() {
 			break
 		}
 		conn := wsc.conn
+		first := wsc.firstMsg
 		wsc.mu.Unlock()
 
 		if conn == nil {
 			return
 		}
+
+		// Deadline applies only until the handshake message arrives; a
+		// paired transfer may be idle between messages.
+		if !first && readDeadlineSet {
+			_ = conn.SetReadDeadline(time.Time{})
+			readDeadlineSet = false
+		} else if first && !readDeadlineSet {
+			_ = conn.SetReadDeadline(time.Now().Add(preHandshakeReadTimeout))
+			readDeadlineSet = true
+		}
+
 		_, data, err := conn.ReadMessage()
 		if err != nil {
 			// the deferred connectionLost handles all cleanup

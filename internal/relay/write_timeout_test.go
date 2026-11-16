@@ -75,7 +75,6 @@ func TestWriteTimeoutTearsDownStuckPair(t *testing.T) {
 			}
 		}
 	}()
-	_ = writeErr
 
 	// once the relay's buffered write to c2 exceeds writeTimeout, the
 	// relay closes both conns and c1's write fails; that's the signal

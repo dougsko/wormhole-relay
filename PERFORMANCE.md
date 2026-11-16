@@ -79,10 +79,13 @@ Then point `relay-stress` at both ports. Keep configurations matched
 
 ## Baseline numbers (2026-11-16, before perf fixes)
 
-Machine: 4 CPUs, loopback only, Go 1.26.8, Linux. Go relay built from this
-tree; Python relay = twisted 26.10.0 / autobahn 26.11.1 on CPython 3.14.4,
-epollreactor. Absolute numbers are machine-specific; the ratios are the
-story.
+Captured on this 4-CPU box with loopback only, Go 1.26.8, Linux (Go relay
+built from this tree; Python relay = twisted 26.10.0 / autobahn 26.11.1 on
+CPython 3.14.4, epollreactor). **Capture conditions matter for reading
+absolute MB/s figures**: the pre-fix baseline was taken with loadavg ≈ 1–2;
+post-fix reruns ran under loadavg 6–14 (frigate, ollama, podman builds on
+this machine). Treat capacity numbers as approximate; allocation counts and
+interleaved A/B ratios are the robust comparisons.
 
 ### Microbenchmarks
 
@@ -122,17 +125,62 @@ BenchmarkHandshake/regex_new     2.77 µs/op
 SQLite INSERT costs this relay ~30% of churn capacity — the single clearest
 target for the async/batched usage-writer fix.
 
-### Stall (mode=stall) — both relays behave the same today
+### Stall (mode=stall)
+
+Pre-fix (both relays):
 
 ```
-go      sender blocked after 2.50 s with ~5.4 MB written; relay did not close the pipe
-python  sender blocked after 2.50 s with ~3.9 MB written; relay did not close the pipe
+go      sender blocked after 2.50 s with ~5.4 MB written; relay never closed the pipe
+python  sender blocked after 2.50 s with ~3.9 MB written; relay never closed the pipe
 ```
 
-Both lack backpressure handling / write deadlines: the sender jams once
-kernel buffers fill and nothing ever recovers. This is expected pre-fix
-behavior on both sides; re-run this after adding write deadlines/pumps to
-verify the stuck pipe gets closed.
+Post-fix (Go relay): the relay's write to the stuck receiver hits
+`writeTimeout` (30 s default, 300 ms in `write_timeout_test.go`) and the
+relay tears the whole pair down — `write_timeout_test.go` verifies teardown
+and usage recording. The Python reference is unchanged.
+
+## Post-fix numbers (2026-11-16, after the review fixes)
+
+What changed relative to baseline, commit by commit (see `git log`):
+
+- **Defensive 64 KiB copy per read removed + handshake slices zero-copy**
+  (`c9c778e`): `BenchmarkRelayThroughput` dropped from ~8.4 MB allocs and
+  ~135 allocs per 8 MiB transfer to **~200 B and 5 allocs**; MB/s improved
+  522 → 837 on a quiet box (≈60%). Small-message MB/s 19 → 22.6.
+- **Accepted conns get TCP_NODELAY + WS endpoint moved to explicit
+  http.Server with timeouts + accept-loop backoff** (`0ca0c4b`).
+- **FD leak closed** (`ee2bf58`): teardown now closes the relay-side
+  socket (regression tests: `connclose_test.go`).
+- **Usage recording moved off the teardown path, batched in one tx**
+  (`eb9b772`): `Record` costs **~550 ns** on the caller (was ~43.5 µs
+  against SQLite — ~80× cheaper); batch of 64 amortizes to **~14–15 µs**
+  per event. No churn regression vs pre-async build in interleaved runs
+  under loadavg ≈ 1–15 (means statistically identical; the earlier −30%
+  with `--usage-db` was measured on a quieter box and is expected to
+  improve correspondingly — the teardown-path INSERT no longer exists).
+- **Write deadlines (30 s data / 5 s close frame) + WS write mutex +
+  panic isolation** (`d3da747`, race fix `80fd0c9`): a stuck receiver now
+  tears the pair down at the write timeout instead of leaking goroutines;
+  see `write_timeout_test.go` (0.3 s teardown with a 300 ms test timeout).
+
+### Interleaved A/B under the same (loaded) machine
+
+Throughput (8 × 16 MiB pairs), Go vs Python reference, alternating runs:
+Go pair p50 ≈ **125–148 ms** vs Python ≈ **478–517 ms** (~3.5×).
+Churn (16 workers): Go **≈ 2200 pairs/s** vs Python ≈ **870 pairs/s** (~2.5×).
+Go relay with `--usage-db` keeps `happy` records flowing (11 870 `happy`
+rows from one 5 s churn run).
+
+### Current microbenchmark snapshot (loadavg ≈ 6–14; absolute MB/s deflated)
+
+```
+BenchmarkRelayThroughput              ~515–600 MB/s   178–262 B/op   5 allocs
+BenchmarkRelaySmallMessages           18.7 MB/s       0 B/op         0 allocs
+BenchmarkUsageRecord/no_backends         131 ns/op
+BenchmarkUsageRecord/sqlite_memory       367 ns/op   (enqueue; worker drains concurrently)
+BenchmarkUsageRecord/sqlite_memory_batch64  14.3 µs/op (≈ production shape)
+BenchmarkUpdateStats/active_10000       472 µs/op    (~47 ns per active conn)
+```
 
 ## Reproducing the A/B runs
 
@@ -158,25 +206,31 @@ Verify the usage path end-to-end by adding `--usage-db /tmp/go.sqlite`
 table (`select result, count(*) from usage group by result` — expect
 `happy` rows from the churn runs).
 
-## Fix → benchmark mapping
+## Fix → benchmark mapping (all items now implemented)
 
-| Fix | Proof it worked |
-|---|---|
-| Drop per-read defensive copy | `BenchmarkRelayThroughput` MB/s and B/op improve; `-benchmem` allocs drop ~135/op |
-| Write pump / write deadlines | `mode=stall` reports the relay closing the stuck pipe; throughput unchanged or better |
-| WS write serialization + `recover` | WS stress passes without "concurrent write" panics |
-| Async/batched usage DB writer | `BenchmarkUsageRecord` and `mode=churn` with `--usage-db`: −30% churn penalty shrinks |
-| Accept-loop backoff | fd-exhaustion soak: flat CPU, bounded logs |
-| `TCP_NODELAY` | `BenchmarkRelaySmallMessages` ns/op improves |
-| Handshake buffer cap / WS read limit / server timeouts | flood/slowloris tests (future); memory bounded |
-| `recordUsage` race fix | `go test -race` + WS/TCP mixed-pair test |
+| Fix | Proof it worked | Status |
+|---|---|---|
+| Drop per-read defensive copy | `BenchmarkRelayThroughput` allocs 135 → 5 per op; bytes 8.4 MB → ~200 B; MB/s 522 → 837 (quiet box) | done (`c9c778e`) |
+| Write pump / write deadlines | `write_timeout_test.go`: stuck pair self-closes at the write deadline; teardown ~0.3 s with 300 ms override. (Chose deadline+self-close over a pump: a pump can't fix per-direction head-of-line blocking either, and it adds per-conn buffer management.) | done (`d3da747`) |
+| WS write serialization + `recover` | WS write mutex added; per-connection panic isolation at both entry points; WS tests + `-race` clean | done (`d3da747`) |
+| Async/batched usage DB writer | `BenchmarkUsageRecord`: Record ≈ 550 ns (was 43.5 µs); `sqlite_memory_batch64` ≈ 14.3 µs/op amortized | done (`eb9b772`) |
+| Accept-loop backoff | `0ca0c4b`: exponential backoff 5 ms→1 s on TCP accept errors; fatal only if the listener closes; WS path uses `http.Serve`'s built-in backoff | done |
+| `TCP_NODELAY` | `noDelayListener` wraps both listeners; `BenchmarkRelaySmallMessages` improved (19 → 22.6 MB/s on a quiet box) | done (`0ca0c4b`) |
+| Handshake buffer cap, WS read limit, server timeouts | `handshake_bounds_test.go`, `WS SetReadLimit` (4 MiB), `ReadHeaderTimeout` on the WS `http.Server` | done (`c9c778e`, `0ca0c4b`) |
+| `recordUsage` race fix | `buddyStats()` interface method with mutex; new `pair_race_test.go` clean under `-race -count=5` | done (`db34544`) |
+| (found during fixes) relay-side FD leak in `connectionLost` | closed; `connclose_test.go` asserts `net.ErrClosed` semantics, negative-controlled | done (`ee2bf58`) |
 
 ## Caveats
 
-- 4-CPU box; both servers share it. Numbers are noisy (±5%); interleave
-  runs and use `benchstat` for benchmarks.
+- This box runs frigate, ollama and podman builds; loadavg oscillates
+  between ~1 and ~15. Absolute MB/s numbers are not comparable across
+  runs weeks apart; use `benchstat` on interleaved runs, or compare
+  allocs/op (machine-independent) and ratios from interleaved A/B.
 - Loopback only — kernel buffers, Nagle and epoll behavior differ from a
   real network. No WS transit benchmark yet (gorilla framing not exercised
   by `relay-stress`); add one if the WS path gets optimized.
 - The Python reference is included for context, not as a hard target; it is
   not expected to match Go on raw throughput.
+- `mode=stall` measures at the client side; the authoritative check for
+  the stuck-pipe fix is `write_timeout_test.go`, which has deterministic
+  control over `writeTimeout`.
